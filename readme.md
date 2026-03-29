@@ -1,321 +1,410 @@
-# 📋 TP5 – Classification Partielle Multi-objectif avec JMetalPy
-### M2 MIAGE – OAFD | Université de Lille
+# Classification Partielle Multi-Objectif avec JMetalPy
 
-> **Rendu :** Rapport PDF + Code Python dans un fichier `.zip`  
-> **Travail :** Binôme autorisé  
-> **Datasets :** `yeast1` et `pima_diabète`
+**M2 MIAGE - Optimisation et Aide a la Decision (OAFD) | Universite de Lille**
 
 ---
 
-## 📁 Structure du projet recommandée
+## Presentation du projet
+
+Ce projet implemente un systeme de **classification partielle multi-objectif** utilisant des algorithmes evolutionnaires (NSGA-II et SPEA2) via le framework JMetalPy. L'objectif est de decouvrir automatiquement des **regles de classification interpretables** (de type SI...ALORS) en optimisant simultanement deux metriques antagonistes : la **precision** (Confiance) et le **rappel** (Sensibilite).
+
+Les regles sont comparees aux classifieurs classiques Scikit-Learn (Random Forest, SVM, C4.5) pour evaluer leur competitivite tout en conservant leur avantage en termes d'interpretabilite.
+
+---
+
+## Datasets
+
+| Dataset | Instances | Attributs | Positifs | Negatifs | Tache |
+|---|---|---|---|---|---|
+| `pima_diabetes.csv` | 768 | 8 | 268 | 500 | Detection du diabete (Glucose, BMI, Age...) |
+| `yeast1.csv` | 1484 | 8 | 463 | 1021 | Localisation cellulaire de proteines de levure |
+
+Les deux datasets sont des problemes de **classification binaire desequilibree** : la classe positive est minoritaire, ce qui rend le compromis precision/rappel particulierement pertinent.
+
+---
+
+## Prerequis et Installation
+
+```bash
+pip install jmetalpy scikit-learn numpy pandas matplotlib
+```
+
+Versions testees : jmetalpy>=1.5.5, scikit-learn>=1.0, numpy>=1.21, pandas>=1.3, matplotlib>=3.4
+
+---
+
+## Structure du projet
 
 ```
-TP5_ClassifPartielle_MO/
-│
-├── data/
-│   ├── yeast1.csv
-│   └── pima_diabete.csv
-│
-├── src/
-│   ├── problem_partialclassif_MO.py     # Définition du problème MO
-│   ├── nsga2_runner.py                  # Exécution NSGA-II
-│   ├── autre_ga_runner.py               # Exécution 2ème algorithme MO
-│   ├── sklearn_baselines.py             # RF, SVM, C4.5
-│   ├── tuning.py                        # Tuning des hyperparamètres
-│   └── analysis.py                      # Boxplots, fronts Pareto, tableaux
-│
-├── results/
-│   ├── pareto_fronts/
-│   ├── boxplots/
-│   └── tables/
-│
-├── rapport.pdf
+Projet_PartialClassification_multi-objectif/
+├── Multi_PartialClassif_v2.ipynb   # Notebook principal (code commente)
+├── pima_diabetes.csv               # Dataset PIMA Indians Diabetes
+├── yeast1.csv                      # Dataset Yeast1
+├── boxplots_hv.png                 # Boxplots HV par taille de population
+├── pareto_fronts_sklearn.png       # Fronts Pareto vs Scikit-Learn (train)
+├── comparison_test.png             # Comparaison Precision/Recall (test)
+├── convergence_study.png           # Courbe de convergence HV vs budget
 └── README.md
 ```
 
 ---
 
-## ✅ CHECKLIST GLOBALE DU PROJET
+## Description detaillee de chaque cellule du notebook
 
-### Phase 0 – Préparation
-- [ ] Récupérer le code du TP3 (algorithme génétique mono-objectif)
-- [ ] Récupérer les résultats TP3 pour C4.5, Random Forest et SVM (precision + recall)
-- [ ] Vérifier que JMetalPy est installé (`pip install jmetalpy`)
-- [ ] Vérifier que sklearn est installé (`pip install scikit-learn`)
-- [ ] Charger et vérifier les deux datasets : `yeast1` et `pima_diabète`
+### Cellule 1 - Imports et dependances
 
----
+Charge toutes les bibliotheques requises. Doit etre executee en premier.
 
-## ✅ CHECKLIST PARTIE 1 – Transformation en Multi-objectif
+**Bibliotheques standard** :
+- `random` : generateur pseudo-aleatoire (graines pour reproductibilite)
+- `warnings` : suppression des alertes non critiques de JMetalPy et sklearn
+- `time` : mesure des temps d'execution des algorithmes
+- `numpy` : calcul numerique vectorise (tableaux, statistiques, opérations matricielles)
+- `pandas` : lecture et manipulation des fichiers CSV en DataFrames
+- `matplotlib` : trace des graphiques (boxplots, scatter plots, courbes de convergence)
 
-### 1.1 – Modifier la définition du problème
+**Scikit-Learn** :
+- `StratifiedKFold` : validation croisee preservant les proportions de classes positives
+- `train_test_split` : decoupage stratifie train/test (70%/30%)
+- `RandomForestClassifier` : foret aleatoire (boite noire, 100 arbres)
+- `SVC` : Support Vector Machine (boite noire, noyau RBF)
+- `DecisionTreeClassifier` : arbre de decision C4.5-like (boite blanche, max_depth=4)
+- `precision_score`, `recall_score`, `f1_score`, `accuracy_score` : metriques d'evaluation
 
-- [ ] Ouvrir le fichier de définition du problème du TP3
-- [ ] Changer le nombre d'objectifs de **1** à **2** dans JMetalPy :
-  ```python
-  self.number_of_objectives = 2
-  ```
-- [ ] Modifier la fonction `evaluate()` pour retourner **deux objectifs séparés** :
-  ```python
-  def evaluate(self, solution):
-      # Calculer y_pred à partir des règles encodées
-      precision = sklearn.metrics.precision_score(y_test, y_pred)
-      recall    = sklearn.metrics.recall_score(y_test, y_pred)
-      
-      # JMetalPy minimise → on inverse le signe pour maximiser
-      solution.objectives[0] = -precision   # Maximiser la confiance
-      solution.objectives[1] = -recall      # Maximiser la sensibilité
-      return solution
-  ```
-- [ ] Vérifier que la représentation des individus (bornes + activation) reste identique au TP3
-- [ ] Tester que le problème s'instancie sans erreur
-
-### 1.2 – Vérifier les opérateurs génétiques
-
-- [ ] Vérifier que les opérateurs de **sélection** sont compatibles multi-objectif
-- [ ] Vérifier que les opérateurs de **croisement** fonctionnent toujours
-- [ ] Vérifier que les opérateurs de **mutation** fonctionnent toujours
+**JMetalPy** :
+- `Problem`, `FloatSolution` : classes de base pour un probleme MO a variables reelles
+- `PolynomialMutation` : mutation polynomiale controlee par `distribution_index` (grand = petite perturbation)
+- `SBXCrossover` : Simulated Binary Crossover, recombine deux parents dans l'espace reel
+- `StoppingByEvaluations` : critere d'arret base sur le nombre d'evaluations
+- `get_non_dominated_solutions` : filtre les solutions non-dominees (front de Pareto)
+- `NSGAII` : Non-dominated Sorting Genetic Algorithm II (Deb et al. 2002)
+- `SPEA2` : Strength Pareto Evolutionary Algorithm 2 (Zitzler et al. 2001)
+- `HyperVolume` : calcul du volume de l'espace objectif domine par le front
 
 ---
 
-## ✅ CHECKLIST PARTIE 2 – Implémentation des 2 Algorithmes MO
+### Cellule 2 - Chargement des donnees
 
-### 2.1 – Algorithme 1 : NSGA-II (obligatoire)
+Lit les deux fichiers CSV et produit les matrices X (features) et vecteurs y (labels).
 
-- [ ] Importer NSGA-II depuis JMetalPy :
-  ```python
-  from jmetal.algorithm.multiobjective.nsgaii import NSGAII
-  ```
-- [ ] Configurer NSGA-II avec les paramètres de base :
-  - [ ] Taille de population (à tuner)
-  - [ ] Nombre de générations
-  - [ ] Opérateurs de croisement et mutation
-- [ ] Tester une exécution complète sur `yeast1`
-- [ ] Tester une exécution complète sur `pima_diabète`
-- [ ] Vérifier que le front de Pareto est bien retourné
+```python
+X_pima  = df_pima.drop('Outcome', axis=1).to_numpy()  # Matrice 768x8
+y_pima  = df_pima['Outcome'].to_numpy()               # Labels 0=sain, 1=diabetique
 
-### 2.2 – Algorithme 2 : Autre AG MO (au choix)
+X_yeast = df_yeast.drop('Output', axis=1).to_numpy()  # Matrice 1484x8
+y_yeast = df_yeast['Output'].to_numpy()               # Labels 0=autre, 1=cytoplasme
+```
 
-Choisir **un** des algorithmes suivants dans JMetalPy :
-- [ ] **SPEA2** *(recommandé)*
-- [ ] MOEA/D
-- [ ] SMS-EMOA
-- [ ] GDE3
-
-- [ ] Importer l'algorithme choisi depuis JMetalPy
-- [ ] Configurer avec les mêmes paramètres de base que NSGA-II (pour comparaison équitable)
-- [ ] Tester une exécution complète sur `yeast1`
-- [ ] Tester une exécution complète sur `pima_diabète`
-- [ ] Vérifier que le front de Pareto est bien retourné
+Affiche les dimensions, le nombre de positifs/negatifs, et les noms d'attributs de chaque dataset.
 
 ---
 
-## ✅ CHECKLIST PARTIE 3 – Tuning des paramètres
+### Cellule 3 - Baselines Scikit-Learn (validation croisee 3-fold)
 
-> **Règle :** On ne tune QUE la taille de population (3 valeurs à choisir)
+Evalue trois classifieurs en **validation croisee stratifiee a 3 plis** pour obtenir des references.
 
-### 3.1 – Définir le protocole de tuning
+**Fonction `run_sklearn(X, y, model_fn, n_folds=3)`** :
+1. Cree 3 plis equilibres avec `StratifiedKFold`
+2. Pour chaque pli : entraine le modele sur 2/3 des donnees, predit sur 1/3
+3. Calcule precision, recall, F1 sur le pli de test
+4. Retourne les moyennes et ecarts-types sur les 3 plis
 
-- [ ] Choisir 3 tailles de population à tester, par exemple :
-  - [ ] Petite : `pop_size = 50`
-  - [ ] Moyenne : `pop_size = 100`
-  - [ ] Grande : `pop_size = 200`
-- [ ] Fixer tous les autres paramètres (générations, probabilités de croisement/mutation)
-- [ ] Documenter les choix dans un tableau :
-
-| Paramètre | Valeur fixée |
-|---|---|
-| Nombre de générations | ? |
-| Probabilité de croisement | ? |
-| Probabilité de mutation | ? |
-| Taille de population | 50 / 100 / 200 |
-
-### 3.2 – Exécuter le tuning
-
-- [ ] Lancer **20 runs** par algorithme × par taille de population × par dataset
-  - Total minimum : `2 algos × 3 pop_size × 2 datasets × 20 runs = 240 exécutions`
-- [ ] Calculer l'**Hypervolume (HV)** pour chaque run
-- [ ] Sauvegarder tous les résultats dans des fichiers CSV
-
-### 3.3 – Analyser les résultats du tuning
-
-- [ ] Produire un **boxplot par algorithme** (HV en fonction de la pop_size)
-- [ ] Produire un boxplot pour `yeast1` et un pour `pima_diabète`
-- [ ] Identifier la meilleure taille de population pour chaque algorithme
-- [ ] Rédiger une **interprétation** des boxplots dans le rapport
-
----
-
-## ✅ CHECKLIST PARTIE 4 – Comparaison des 2 algorithmes MO
-
-- [ ] Utiliser la meilleure configuration trouvée au tuning pour chaque algorithme
-- [ ] Lancer 20 runs pour NSGA-II et 20 runs pour l'autre AG (sur les 2 datasets)
-- [ ] Calculer l'HV pour chaque run
-- [ ] Produire un boxplot NSGA-II vs Autre AG (HV)
-- [ ] Réaliser un **test statistique** si possible (ex: Wilcoxon)
-- [ ] Rédiger une conclusion sur quel algorithme est le meilleur
-
----
-
-## ✅ CHECKLIST PARTIE 5 – Comparaison avec Sklearn
-
-### Étape 1 – Visualiser les fronts de Pareto
-
-- [ ] Pour chaque algorithme, récupérer les 20 fronts de Pareto obtenus sur le **training**
-- [ ] Calculer l'HV pour chaque front
-- [ ] **Sélectionner le run avec le meilleur HV** comme front représentatif
-- [ ] Tracer un graphique (axe X = Sensibilité, axe Y = Confiance) pour chaque dataset
-  - [ ] Afficher les 20 fronts en gris clair (transparents)
-  - [ ] Afficher le meilleur front en couleur vive
-  - [ ] **Sauvegarder la Figure 1**
-
-### Étape 2 – Comparaison sur le TRAINING
-
-- [ ] Récupérer les scores **precision** et **recall** du TP3 pour :
-  - [ ] C4.5 (sur training, `yeast1`)
-  - [ ] Random Forest (sur training, `yeast1`)
-  - [ ] SVM (sur training, `yeast1`)
-  - [ ] C4.5 (sur training, `pima_diabète`)
-  - [ ] Random Forest (sur training, `pima_diabète`)
-  - [ ] SVM (sur training, `pima_diabète`)
-- [ ] Sur le même graphique que l'Étape 1, ajouter ces 3 points (C4.5, RF, SVM)
-- [ ] **Sauvegarder la Figure 2**
-
-### Étape 3 – Évaluation sur le TEST
-
-- [ ] Prendre le meilleur front Pareto (meilleur HV training) pour chaque AG
-- [ ] Pour chaque solution du front, **calculer precision et recall sur le test**
-- [ ] Calculer la **F1-mesure** sur le test pour chaque solution
-- [ ] Choisir la solution avec le **meilleur F1-score** sur le training pour la présenter
-- [ ] Évaluer cette solution sur le test
-- [ ] **Sauvegarder la Figure 3** (solution choisie + front Pareto sur test)
-- [ ] Remplir le tableau de résultats :
-
-| Métrique | RF | SVM | C4.5 | NSGA-II | Autre AG |
-|---|---|---|---|---|---|
-| Confiance (training) | | | | | |
-| Sensibilité (training) | | | | | |
-| F1-mesure (training) | | | | | |
-| Confiance (test) | | | | | |
-| Sensibilité (test) | | | | | |
-| F1-mesure (test) | | | | | |
-| Hypervolume | / | / | / | | |
-
-> Répéter ce tableau pour `yeast1` ET `pima_diabète`
-
----
-
-## ✅ CHECKLIST PARTIE 6 – Analyse et Interprétabilité
-
-### 6.1 – Analyse des résultats
-
-- [ ] Comparer les performances de NSGA-II vs Autre AG (HV, F1, Precision, Recall)
-- [ ] Comparer les AG MO avec les algorithmes sklearn
-- [ ] Discuter du compromis **confiance / sensibilité** observé sur les fronts Pareto
-- [ ] Expliquer pourquoi les AG MO produisent un front et pas un seul point
-- [ ] Analyser les différences entre `yeast1` et `pima_diabète`
-
-### 6.2 – Analyse de l'interprétabilité
-
-- [ ] Extraire au moins **une règle interprétable** trouvée par NSGA-II sur chaque dataset
-- [ ] Comparer avec les règles de C4.5 (aussi interprétable)
-- [ ] Comparer avec RF et SVM (boîtes noires)
-- [ ] Rédiger un paragraphe sur l'intérêt de l'interprétabilité pour le décideur
-
----
-
-## ✅ CHECKLIST PARTIE 7 – Rédaction du Rapport
-
-### Structure minimale du rapport
-
-- [ ] **Page de garde** : titre, auteurs, date
-- [ ] **Introduction** : rappel de la classification partielle et de l'objectif
-- [ ] **Section 1 – Modélisation** : définition du problème MO (solution, objectifs, représentation, opérateurs)
-- [ ] **Section 2 – Algorithmes** : description de NSGA-II et de l'autre AG choisi
-- [ ] **Section 3 – Protocole expérimental** : datasets, splits, métriques, nb de runs
-- [ ] **Section 4 – Tuning** : tableaux, boxplots, conclusion sur les paramètres
-- [ ] **Section 5 – Comparaison des AG** : boxplots, test statistique, conclusion
-- [ ] **Section 6 – Comparaison Sklearn** : Figure 1, Figure 2, Figure 3, tableau récapitulatif
-- [ ] **Section 7 – Analyse et Interprétabilité** : discussion, règles extraites
-- [ ] **Conclusion** : synthèse des résultats et perspectives
-
-### Éléments visuels à inclure
-
-- [ ] Boxplots du tuning (HV vs pop_size) pour chaque algo et dataset
-- [ ] Boxplot de comparaison NSGA-II vs Autre AG
-- [ ] Figure 1 : 20 fronts Pareto (un par run) + meilleur front mis en évidence
-- [ ] Figure 2 : Meilleur front Pareto + points C4.5, RF, SVM
-- [ ] Figure 3 : Solution choisie (meilleur F1) mise en évidence sur le front
-
----
-
-## ✅ CHECKLIST PARTIE 8 – Rendu final
-
-- [ ] Vérifier que le rapport répond à **toutes les questions** du sujet
-- [ ] Vérifier que chaque tableau de résultats est complet (training + test)
-- [ ] Vérifier que le code est bien commenté
-- [ ] Vérifier que le code est exécutable (dépendances documentées)
-- [ ] Créer un fichier `requirements.txt` :
-  ```
-  jmetalpy
-  scikit-learn
-  matplotlib
-  pandas
-  numpy
-  scipy
-  ```
-- [ ] Créer le fichier `.zip` contenant :
-  - [ ] `rapport.pdf`
-  - [ ] Dossier `src/` avec tous les scripts Python
-  - [ ] Dossier `results/` avec les résultats générés
-  - [ ] `README.md`
-  - [ ] `requirements.txt`
-- [ ] Vérifier le nom du fichier zip : `NOM1_NOM2_TP5.zip`
-- [ ] **Soumettre le rendu** avant la deadline
-
----
-
-## 📌 Métriques clés à connaître
-
-| Métrique | Formule | Objectif |
+| Classifieur | Type | Parametres |
 |---|---|---|
-| **Confiance (Precision)** | TP / (TP + FP) | Maximiser |
-| **Sensibilité (Recall)** | TP / (TP + FN) | Maximiser |
-| **F1-mesure** | 2 × (P × R) / (P + R) | Référence |
-| **Hypervolume (HV)** | Volume dominé par le front | Maximiser |
+| Random Forest (RF) | Boite noire | n_estimators=100, random_state=42 |
+| SVM | Boite noire | kernel='rbf', random_state=42 |
+| C4.5 (DecisionTree) | Boite blanche | max_depth=4, random_state=42 |
+
+Resultats stockes dans `sklearn_results[dataset][algo]` pour la comparaison finale.
 
 ---
 
-## 🔧 Commandes utiles
+### Cellule 4 - Classe PartialClassifMO et fonctions utilitaires
 
-```bash
-# Installer les dépendances
-pip install jmetalpy scikit-learn matplotlib pandas numpy scipy
+**Coeur du projet.** Definit le probleme d'optimisation multi-objectif via la classe `Problem` de JMetalPy.
 
-# Lancer une exécution NSGA-II
-python src/nsga2_runner.py --dataset yeast1 --pop_size 100 --runs 20
+#### Representation Michigan (une regle par individu)
 
-# Lancer le tuning
-python src/tuning.py --dataset pima_diabete
+Chaque individu encode une unique regle de classification :
 
-# Générer les graphiques
-python src/analysis.py --output results/
+```
+SI attr_0 dans [lo_0, hi_0] ET attr_1 dans [lo_1, hi_1] ET ... --> classe positive
+```
+
+Pour un dataset a n attributs, chaque solution contient 2n variables reelles :
+- `variables[2i]`   = borne inferieure `lo_i` de l'attribut i
+- `variables[2i+1]` = borne superieure `hi_i` de l'attribut i
+
+Un attribut est active si `lo_i <= hi_i`. Si `lo_i > hi_i`, l'attribut est ignore.
+
+#### Objectifs (minimisation dans JMetalPy)
+
+| Objectif | Formule stockee | Signification reelle |
+|---|---|---|
+| `objectives[0]` | `-Precision = -TP/(TP+FP)` | Qualite des predictions positives |
+| `objectives[1]` | `-Recall = -TP/(TP+FN)` | Taux de detection des positifs reels |
+
+JMetalPy minimise : minimiser -f est equivalent a maximiser f.
+
+#### Methodes de la classe PartialClassifMO
+
+**`__init__(X, y)`** : stocke les donnees, identifie les indices positifs/negatifs, calcule les bornes [min_attribut, max_attribut+1] pour l'espace de recherche (l'extension +1 permet des intervalles desactives avec lo > hi).
+
+**`_decode(solution)`** : traduit le vecteur de 2n variables en predictions binaires. Pour chaque exemple j, predit 1 si TOUS les attributs actives ont leur valeur dans l'intervalle correspondant. Retourne zeros si aucun attribut n'est active.
+
+**`evaluate(solution)`** : appelle `_decode`, puis calcule `-precision_score` et `-recall_score`. Si y_pred.sum()==0 (regle vide), les deux objectifs valent 0.0.
+
+**`create_solution()`** : genere un individu initial valide en selectionnant 1 exemple positif + 1 negatif, activant 2 attributs aleatoires avec un intervalle [min(vp,vn), max(vp,vn)], desactivant les autres (lo = vp+1 > hi = vp).
+
+#### Fonctions utilitaires
+
+**`predict(solution_vars, X)`** : applique la regle encodee sur un dataset X quelconque (train ou test).
+
+**`decode_rule(solution_vars, feature_names)`** : affiche la regle en langage naturel.
+Exemple de sortie : `Regle : SI Glucose dans [120.500, 180.200] ET BMI dans [30.100, 45.000] --> classe positive`
+
+**`compute_hv(solutions, ref_point=[0.05, 0.05])`** : calcule l'hypervolume du front.
+Construit la matrice des objectifs puis appelle `HyperVolume(ref_point).compute(front)`.
+
+**`get_pareto_front(solutions)`** : retourne uniquement les solutions non-dominees via `get_non_dominated_solutions`.
+
+---
+
+### Cellule 5 - Parametres experimentaux et split train/test
+
+| Parametre | Valeur | Description |
+|---|---|---|
+| `CROSSOVER_PROB` | 0.9 | Probabilite d'application du croisement SBX |
+| `CROSSOVER_INDEX` | 20.0 | Grand indice = enfants proches des parents (exploitation) |
+| `MUTATION_INDEX` | 20.0 | Grand indice = petites perturbations (stabilite) |
+| `MAX_EVALUATIONS` | 500 | Budget d'evaluations (defini apres etude de convergence) |
+| `N_RUNS` | 20 | Runs independants par configuration (robustesse statistique) |
+| `REF_POINT` | [0.05, 0.05] | Point de reference HV |
+| `POP_SIZES` | [20, 50, 100] | 3 tailles de population comparees |
+
+Split 70%/30% stratifie (random_state=42) :
+- PIMA : 537 train / 231 test
+- Yeast1 : 1038 train / 446 test
+
+---
+
+### Cellule 6 - Etude de convergence
+
+Calibrage empirique du budget `MAX_EVALUATIONS` optimal.
+
+Teste 8 budgets [100, 250, 500, 1000, 2500, 5000, 7500, 10000] avec NSGA-II sur PIMA (representatif).
+Pour chaque budget : 1 run -> calcul HV -> trace de la courbe.
+
+**`find_plateau(budgets, hvs, threshold=0.01)`** : detecte le premier budget ou le gain relatif `(HV[i]-HV[i-1])/HV[i-1]` passe sous 1%.
+
+Sortie : `convergence_study.png` (echelle log en X) avec ligne verticale rouge sur le budget retenu.
+
+---
+
+### Cellule 7 - Fixation definitive de MAX_EVALUATIONS
+
+Cellule interactive : l'utilisateur lit la courbe et modifie manuellement `MAX_EVALUATIONS`.
+Valeur retenue : **500 evaluations**.
+
+---
+
+### Cellule 8 - Fonctions d'execution des algorithmes
+
+**`run_mo_algorithm(algo_name, X_train, y_train, pop_size, max_evaluations, seed)`**
+
+Lance un run unique :
+1. Fixe `random.seed(seed)` et `np.random.seed(seed)`
+2. Instancie `PartialClassifMO(X_train, y_train)`
+3. Configure `PolynomialMutation(prob=1/n_vars)` et `SBXCrossover(prob=0.9)`
+4. Cree `StoppingByEvaluations(max_evaluations)`
+5. Execute `algo.run()` et retourne `algo.get_result()` (population finale)
+
+**`run_experiments(algo_name, X_train, y_train, pop_sizes, n_runs)`**
+
+Lance 20 runs independants par taille de population (seed = 100*run + 42).
+Pour chaque run : extrait le front de Pareto, calcule l'HV.
+Retourne `{pop_size: {"hv": [20 valeurs], "fronts": [20 fronts]}}`.
+
+---
+
+### Cellules 9 a 12 - Execution des experiences principales
+
+| Cellule | Algorithme | Dataset | Variable |
+|---|---|---|---|
+| 9 | NSGA-II | PIMA | `nsgaii_pima` |
+| 10 | NSGA-II | Yeast1 | `nsgaii_yeast` |
+| 11 | SPEA2 | PIMA | `spea2_pima` |
+| 12 | SPEA2 | Yeast1 | `spea2_yeast` |
+
+**Total : 240 runs** (2 algos x 2 datasets x 3 pop_sizes x 20 runs).
+
+---
+
+### Cellule 13 - Boxplots de l'hypervolume
+
+Grille 2x2 de boxplots (NSGA-II/SPEA2 x PIMA/Yeast1) comparant la distribution HV sur 20 runs.
+
+**Lecture** : mediane (trait noir), boite Q1-Q3, moustaches, outliers.
+**Interpretation** : boite haute et etroite = algorithme performant ET stable.
+
+Sortie : `boxplots_hv.png`
+
+---
+
+### Cellule 14 - Selection du meilleur front Pareto
+
+**`get_best_run`** : identifie parmi les 60 runs le front avec l'HV maximal.
+
+**`front_to_prec_rec`** : convertit `objectives[i]` negatifs en Precision/Recall positifs.
+
+**`best_f1_solution`** : selectionne dans le front la solution maximisant le F1 sur X_train.
+Cette solution sert de representant unique pour la comparaison avec Scikit-Learn.
+
+Structure du dict `best[dataset][algo]` :
+- `pop` : taille de population du meilleur run
+- `front` : liste des solutions non-dominees du meilleur run
+- `hv` : hypervolume maximal atteint
+- `best_sol` : solution avec le meilleur F1 sur le train
+- `best_f1_train` : valeur du F1 correspondant
+
+---
+
+### Cellule 15 - Visualisation des fronts Pareto (train)
+
+Nuage de points (Recall en X, Precision en Y) avec :
+- Points bleus : front NSGA-II
+- Points oranges : front SPEA2
+- Etoile noire : solution F1-max de chaque algorithme
+- Symboles colores : baselines RF/SVM/C4.5
+
+Sortie : `pareto_fronts_sklearn.png`
+
+---
+
+### Cellule 16 - Evaluation sur le jeu de test
+
+Evalue la meilleure solution de chaque front sur le TEST pour mesurer la generalisation.
+Calcule Precision, Recall, F1, Accuracy sur train et test.
+Affiche la regle decouverte sous forme lisible via `decode_rule`.
+
+---
+
+### Cellule 17 - Tableau recapitulatif comparatif
+
+DataFrame pandas comparant RF, SVM, C4.5, NSGA-II, SPEA2 sur le TEST :
+Precision, Recall, F1, HV, Type (boite noire ou blanche).
+
+---
+
+### Cellule 18 - Graphe comparatif Precision/Recall (test)
+
+Identique a la cellule 15 mais avec toutes les evaluations sur le TEST.
+Detecte un eventuel surapprentissage des regles MO.
+
+Sortie : `comparison_test.png`
+
+---
+
+### Cellule 19 - Graphes de convergence de l'hypervolume
+
+Courbes HV moyen +/- 1 ecart-type en fonction des evaluations pour NSGA-II et SPEA2.
+La bande coloree semi-transparente represente la variabilite inter-runs.
+
+Sortie : `convergence_hv.png`
+
+---
+
+## Indicateur de qualite : l'Hypervolume
+
+L'**Hypervolume (HV)** est la mesure principale de comparaison des fronts de Pareto.
+
+**Definition** : surface de l'espace objectif 2D dominee par le front, delimitee par le point de reference.
+
+```
+HV = surface entre le front de Pareto et le point de reference [0.05, 0.05]
+```
+
+**Proprietes** :
+- Capture a la fois la **convergence** (front proche de l'origine) et la **diversite** (front etale)
+- Point de reference [0.05, 0.05] correspond a Precision > 0.95 ET Recall > 0.95 comme ideal
+- Plus HV est eleve, meilleur est le front (convergence + diversite combinees)
+
+---
+
+## Metriques d'evaluation
+
+| Metrique | Formule | Role dans le projet |
+|---|---|---|
+| Precision (Confiance) | TP / (TP + FP) | Objectif 1 : negation stockee (-Precision) |
+| Rappel (Sensibilite) | TP / (TP + FN) | Objectif 2 : negation stockee (-Recall) |
+| F1-mesure | 2 x P x R / (P + R) | Selection de la meilleure solution du front |
+| Accuracy | (TP + TN) / Total | Information complementaire sur le test |
+| Hypervolume (HV) | Volume domine | Comparaison globale des fronts de Pareto |
+
+---
+
+## Protocole experimental
+
+```
+1. Etude de convergence
+   NSGA-II x PIMA x 8 budgets --> MAX_EVALUATIONS = 500
+
+2. Experiences principales (240 runs)
+   2 algos x 2 datasets x 3 pop_sizes x 20 runs
+   Seeds : 42, 142, 242, ..., 1942
+
+3. Analyse
+   Boxplots HV --> taille de population optimale
+   Meilleur front (HV max) --> visualisation Pareto
+   Meilleure solution F1 --> comparaison avec Scikit-Learn
+   Evaluation sur le test --> generalisation
+   Regles decouvertes --> interpretabilite
 ```
 
 ---
 
-## ⚠️ Points d'attention importants
+## Ordre d'execution recommande
 
-> 1. **JMetalPy minimise** les objectifs → toujours inverser le signe pour maximiser (`-precision`, `-recall`)
->
-> 2. **Hypervolume** : définir un **point de référence** fixe pour tous les calculs HV (ex: `[0, 0]` si les objectifs sont dans `[-1, 0]`)
->
-> 3. **20 runs minimum** par configuration testée — ne pas oublier de fixer la seed différemment à chaque run
->
-> 4. **Training vs Test** : les fronts Pareto sont construits sur le training, mais l'évaluation finale se fait sur le test
->
-> 5. **Expliquer clairement** comment un seul score est extrait des 20 fronts Pareto pour remplir les tableaux comparatifs
+1. Cellule 1 : Imports
+2. Cellule 2 : Chargement des donnees
+3. Cellule 3 : Baselines Scikit-Learn
+4. Cellule 4 : Classe PartialClassifMO et utilitaires
+5. Cellule 5 : Parametres et split train/test
+6. Cellule 6 : Etude de convergence
+7. Cellule 7 : Fixer MAX_EVALUATIONS
+8. Cellule 8 : Fonctions d'execution
+9. Cellules 9-12 : 240 runs (NSGA-II et SPEA2 sur les 2 datasets)
+10. Cellule 13 : Boxplots HV
+11. Cellule 14 : Selection des meilleurs fronts
+12. Cellule 15 : Graphes Pareto (train)
+13. Cellule 16 : Evaluation test + regles lisibles
+14. Cellule 17 : Tableau comparatif final
+15. Cellule 18 : Graphe comparatif (test)
+16. Cellule 19 : Graphes de convergence
 
 ---
 
-*README généré pour le projet TP5 – M2 MIAGE, OAFD, Université de Lille*
+## Fichiers generes
+
+| Fichier | Description |
+|---|---|
+| `boxplots_hv.png` | Grille 2x2 : HV par taille de population (NSGA-II et SPEA2) |
+| `pareto_fronts_sklearn.png` | Fronts Pareto + baselines Scikit-Learn (espace Precision/Recall, train) |
+| `comparison_test.png` | Comparaison Precision/Recall sur le jeu de test |
+| `convergence_study.png` | Courbe HV = f(budget) pour le calibrage de MAX_EVALUATIONS |
+| `convergence_hv.png` | Evolution HV moyen +/- std au fil des evaluations |
+
+---
+
+## Avantages de l'approche multi-objectif
+
+| Aspect | Classifieurs Scikit-Learn | Algorithmes MO (ce projet) |
+|---|---|---|
+| Resultat | Un seul modele (un point) | Un front de N compromis possibles |
+| Interpretabilite | Limitee (RF/SVM boites noires) | Maximale : regle SI...ALORS lisible |
+| Flexibilite | Fixe apres entrainement | Le decideur choisit son compromis P/R |
+| Indicateur de qualite | F1 seule | Hypervolume (convergence + diversite) |
+
+---
+
+*Projet M2 MIAGE - OAFD - Universite de Lille*

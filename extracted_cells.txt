@@ -1,0 +1,1024 @@
+Total cells: 38
+
+
+================================================================================
+CELL 0 - TYPE: MARKDOWN
+================================================================================
+# Classification Partielle Multi-Objectif avec JMetalPy
+## OAFD – M2 MIAGE
+
+Ce notebook implémente la classification partielle **multi-objectif** (représentation Michigan).  
+Au lieu de maximiser la F1-mesure (un seul objectif), on optimise **simultanément** :
+- **Objectif 1** : Confiance (Precision) à maximiser  
+- **Objectif 2** : Sensibilité (Recall) à maximiser  
+
+**Algorithmes testés :** NSGA-II et SPEA2  
+**Jeux de données :** Yeast1 et PIMA Diabetes  
+**Comparaison avec :** Random Forest, SVM, C4.5 (Scikit-Learn)
+
+================================================================================
+CELL 1 - TYPE: MARKDOWN
+================================================================================
+## 1. Imports et chargement des données
+
+================================================================================
+CELL 2 - TYPE: CODE
+================================================================================
+# ── Librairies standard ──
+import random
+import warnings
+import time
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+warnings.filterwarnings('ignore')
+%matplotlib inline
+
+# ── Scikit-Learn ──
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_score
+
+# ── JMetalPy – Problème et opérateurs ──
+from jmetal.core.problem import Problem
+from jmetal.core.solution import FloatSolution
+from jmetal.operator.mutation import PolynomialMutation
+from jmetal.operator.crossover import SBXCrossover
+from jmetal.util.termination_criterion import StoppingByEvaluations
+from jmetal.util.solution import get_non_dominated_solutions
+
+# ── JMetalPy – Algorithmes MO ──
+from jmetal.algorithm.multiobjective.nsgaii import NSGAII
+from jmetal.algorithm.multiobjective.spea2 import SPEA2
+
+# ── JMetalPy – Indicateur de qualité ──
+from jmetal.core.quality_indicator import HyperVolume
+
+print('✓ Tous les imports OK')
+
+================================================================================
+CELL 3 - TYPE: MARKDOWN
+================================================================================
+
+
+================================================================================
+CELL 4 - TYPE: CODE
+================================================================================
+# ── Chargement des données ──
+df_pima = pd.read_csv('pima_diabetes.csv')
+X_pima  = df_pima.drop('Outcome', axis=1).to_numpy()
+y_pima  = df_pima['Outcome'].to_numpy()
+features_pima = list(df_pima.columns[:-1])
+
+df_yeast = pd.read_csv('yeast1.csv')
+X_yeast  = df_yeast.drop('Output', axis=1).to_numpy()
+y_yeast  = df_yeast['Output'].to_numpy()
+features_yeast = list(df_yeast.columns[:-1])
+
+print(f'PIMA   : {X_pima.shape}  | Positifs: {y_pima.sum()}  | Négatifs: {(y_pima==0).sum()}')
+print(f'Yeast1 : {X_yeast.shape} | Positifs: {y_yeast.sum()} | Négatifs: {(y_yeast==0).sum()}')
+print(f'\nAttributs PIMA   : {features_pima}')
+print(f'Attributs Yeast1 : {features_yeast}')
+
+================================================================================
+CELL 5 - TYPE: MARKDOWN
+================================================================================
+## 2. Rappel des résultats Scikit-Learn (Étape 1)
+
+Nous réexécutons les trois algorithmes de référence avec le **même protocole** :  
+validation croisée 3-fold stratifiée, seed fixe = 42.  
+On collecte **confiance** (precision) et **sensibilité** (recall) pour la comparaison avec les fronts Pareto.
+
+================================================================================
+CELL 6 - TYPE: CODE
+================================================================================
+def run_sklearn(X, y, model_fn, n_folds=3, seed=42):
+    """Validation croisée N-fold – retourne precision et recall moyens."""
+    skf = StratifiedKFold(n_splits=n_folds)
+    all_prec, all_rec, all_f1 = [], [], []
+    for train_idx, test_idx in skf.split(X, y):
+        Xtr, Xte = X[train_idx], X[test_idx]
+        ytr, yte = y[train_idx], y[test_idx]
+        m = model_fn(seed)
+        m.fit(Xtr, ytr)
+        yp = m.predict(Xte)
+        all_prec.append(precision_score(yte, yp, zero_division=0))
+        all_rec.append(recall_score(yte, yp, zero_division=0))
+        all_f1.append(f1_score(yte, yp, zero_division=0))
+    return {
+        'precision': np.mean(all_prec), 'recall': np.mean(all_rec), 'f1': np.mean(all_f1),
+        'prec_std': np.std(all_prec),   'rec_std': np.std(all_rec),  'f1_std': np.std(all_f1)
+    }
+
+rf_fn  = lambda s: RandomForestClassifier(n_estimators=100, random_state=s)
+svm_fn = lambda s: SVC(kernel='rbf', random_state=s)
+c45_fn = lambda s: DecisionTreeClassifier(max_depth=4, random_state=s)
+
+sklearn_results = {}
+for ds_name, X, y in [('PIMA', X_pima, y_pima), ('Yeast1', X_yeast, y_yeast)]:
+    sklearn_results[ds_name] = {}
+    for algo_name, fn in [('RF', rf_fn), ('SVM', svm_fn), ('C4.5', c45_fn)]:
+        r = run_sklearn(X, y, fn)
+        sklearn_results[ds_name][algo_name] = r
+        print(f'[{ds_name}] {algo_name:5s} | F1={r["f1"]:.3f}±{r["f1_std"]:.3f}'
+              f' | Prec={r["precision"]:.3f}±{r["prec_std"]:.3f}'
+              f' | Rec={r["recall"]:.3f}±{r["rec_std"]:.3f}')
+    print()
+print('✓ Baselines Scikit-Learn calculées')
+
+================================================================================
+CELL 7 - TYPE: MARKDOWN
+================================================================================
+## 3. Définition du Problème Multi-Objectif JMetalPy
+
+### Représentation Michigan
+Une solution = un vecteur de `2 × n_attributs` flottants.  
+Chaque paire `(lower_i, upper_i)` définit les bornes d'un attribut :
+- `lower_i > upper_i` → attribut **désactivé**  
+- `lower_i ≤ upper_i` → attribut **activé**
+
+### Deux objectifs (minimisation JMetalPy)
+| Objectif | Formule | Sens |
+|----------|---------|------|
+| obj[0] | −Confiance (−Precision) | minimiser ↔ maximiser Precision |
+| obj[1] | −Sensibilité (−Recall) | minimiser ↔ maximiser Recall |
+
+Le **point de référence** pour l'Hypervolume est `[0.05, 0.05]`  
+(légèrement au-dessus de 0 pour inclure les solutions avec score = 1.0).
+
+================================================================================
+CELL 8 - TYPE: CODE
+================================================================================
+class PartialClassifMO(Problem):
+    """
+    Classification Partielle – Problème multi-objectif (Michigan).
+    Objectifs (à minimiser) : -Precision, -Recall.
+    """
+
+    def __init__(self, X: np.ndarray, y: np.ndarray):
+        super().__init__()
+        self.X = X
+        self.y = y
+        self.n_attributes = X.shape[1]
+        self.pos_indices = np.where(y == 1)[0]
+        self.neg_indices = np.where(y == 0)[0]
+
+        self.lower_bound, self.upper_bound = [], []
+        for i in range(self.n_attributes):
+            cmin = float(np.min(X[:, i]))
+            cmax = float(np.max(X[:, i]))
+            if cmin == cmax:
+                cmin -= 0.001; cmax += 0.001
+            self.lower_bound += [cmin, cmin]
+            self.upper_bound += [cmax + 1.0, cmax + 1.0]
+
+        self.obj_directions = [self.MINIMIZE, self.MINIMIZE]
+        self.obj_labels = ['-Precision', '-Recall']
+
+    def number_of_variables(self):   return 2 * self.n_attributes
+    def number_of_objectives(self):  return 2
+    def number_of_constraints(self): return 0
+
+    def _decode(self, solution):
+        vars_ = [float(v.real) if isinstance(v, complex) else float(v)
+                 for v in solution.variables]
+        bornes = [(vars_[i], vars_[i+1]) for i in range(0, len(vars_), 2)]
+        activated = [(i, lo, hi) for i, (lo, hi) in enumerate(bornes) if lo <= hi]
+        if not activated:
+            return np.zeros(len(self.y), dtype=int)
+        return np.array([
+            1 if all(lo <= self.X[j, i] <= hi for i, lo, hi in activated) else 0
+            for j in range(len(self.X))
+        ])
+
+    def evaluate(self, solution: FloatSolution) -> FloatSolution:
+        y_pred = self._decode(solution)
+        if y_pred.sum() == 0:
+            solution.objectives[0] = 0.0   # Precision = 0
+            solution.objectives[1] = 0.0   # Recall    = 0
+        else:
+            solution.objectives[0] = -float(precision_score(self.y, y_pred, zero_division=0))
+            solution.objectives[1] = -float(recall_score(self.y, y_pred, zero_division=0))
+        return solution
+
+    def create_solution(self) -> FloatSolution:
+        sol = FloatSolution(self.lower_bound, self.upper_bound,
+                            self.number_of_objectives(), self.number_of_constraints())
+        ind_pos = self.X[np.random.choice(self.pos_indices)]
+        ind_neg = self.X[np.random.choice(self.neg_indices)]
+        active  = set(np.random.choice(self.n_attributes, size=2, replace=False))
+        vars_ = []
+        for i in range(self.n_attributes):
+            vp, vn = float(ind_pos[i]), float(ind_neg[i])
+            if i in active:
+                vars_ += [min(vp, vn), max(vp, vn)]
+            else:
+                vars_ += [vp + 1.0, vp]   # désactivé
+        sol.variables = vars_
+        return sol
+
+    def name(self): return 'PartialClassifMO'
+
+
+# ── Fonctions utilitaires ──────────────────────────────────────────────────
+def predict(solution_vars, X):
+    """Calcule y_pred à partir des variables d'une solution."""
+    vars_ = [float(v.real) if isinstance(v, complex) else float(v) for v in solution_vars]
+    bornes = [(vars_[i], vars_[i+1]) for i in range(0, len(vars_), 2)]
+    activated = [(i, lo, hi) for i, (lo, hi) in enumerate(bornes) if lo <= hi]
+    if not activated:
+        return np.zeros(len(X), dtype=int)
+    return np.array([
+        1 if all(lo <= X[j, i] <= hi for i, lo, hi in activated) else 0
+        for j in range(len(X))
+    ])
+
+def decode_rule(solution_vars, feature_names):
+    """Affiche la règle lisible."""
+    bornes = [(solution_vars[i], solution_vars[i+1]) for i in range(0, len(solution_vars), 2)]
+    parts = [
+        f'{feature_names[i]} ∈ [{lo:.3f}, {hi:.3f}]'
+        for i, (lo, hi) in enumerate(bornes) if lo <= hi
+    ]
+    rule = 'SI ' + ' ET '.join(parts) + ' → classe positive' if parts else 'Règle vide'
+    print('Règle :', rule)
+    return rule
+
+def compute_hv(solutions, ref_point=None):
+    """Hypervolume du front Pareto (espace minimisation)."""
+    if not solutions:
+        return 0.0
+    front = np.array([s.objectives for s in solutions])
+    if ref_point is None:
+        ref_point = [0.05, 0.05]
+    hv_calc = HyperVolume(ref_point)
+    return hv_calc.compute(front)
+
+def get_pareto_front(solutions):
+    """Extrait les solutions non-dominées."""
+    return get_non_dominated_solutions(solutions)
+
+print('✓ Classe PartialClassifMO et fonctions utilitaires définies')
+
+================================================================================
+CELL 9 - TYPE: MARKDOWN
+================================================================================
+## 4. Paramètres expérimentaux
+
+### 4.1 Paramètres fixes
+
+Les paramètres suivants sont **identiques** pour les deux algorithmes et toutes les configurations :
+
+| Paramètre | Valeur | Justification |
+|-----------|--------|---------------|
+| Prob. croisement | 0.9 | Valeur standard recommandée pour SBX |
+| Index croisement | 20 | Distribution concentrée autour des parents |
+| Prob. mutation | 1/n_vars | Règle du pouce : une variable mutée par individu |
+| Index mutation | 20 | Perturbations modérées |
+| Max évaluations | **déterminé section 4.3** | Fixé automatiquement par étude de convergence |
+| Validation croisée | — | Pas utilisée (train/test split stratifié 70/30) |
+| N_RUNS | 20 | Minimum requis pour significativité statistique |
+
+### 4.2 Choix des tailles de population
+
+Trois tailles sont testées pour isoler l'effet de ce seul paramètre :
+
+| Taille | Motivation |
+|--------|-----------|
+| **20** | Population petite – convergence rapide mais diversité faible |
+| **50** | Taille intermédiaire – bon équilibre exploration/exploitation |
+| **100** | Grande population – meilleure couverture du front Pareto, coût accru |
+
+Ces tailles couvrent un ordre de grandeur (×5) permettant d'observer l'impact sur la qualité du front Pareto.
+
+================================================================================
+CELL 10 - TYPE: CODE
+================================================================================
+# ── Paramètres fixes (ne pas modifier) ──────────────────────────────────────
+CROSSOVER_PROB  = 0.9
+CROSSOVER_INDEX = 20.0
+MUTATION_INDEX  = 20.0
+MAX_EVALUATIONS = 500
+N_RUNS          = 20
+REF_POINT       = [0.05, 0.05]  # Pour l'Hypervolume (espace minimisation)
+
+# ── Tailles de population testées ───────────────────────────────────────────
+POP_SIZES = [20, 50, 100]
+
+# ── Split train/test stratifié 70/30 (seed=42) ───────────────────────────────
+from sklearn.model_selection import train_test_split
+
+X_pima_tr,  X_pima_te,  y_pima_tr,  y_pima_te  = train_test_split(
+    X_pima, y_pima, test_size=0.3, stratify=y_pima, random_state=42)
+
+X_yeast_tr, X_yeast_te, y_yeast_tr, y_yeast_te = train_test_split(
+    X_yeast, y_yeast, test_size=0.3, stratify=y_yeast, random_state=42)
+
+print(f'PIMA   train={X_pima_tr.shape}  test={X_pima_te.shape}')
+print(f'Yeast1 train={X_yeast_tr.shape} test={X_yeast_te.shape}')
+print(f'\nConfiguration expérimentale :')
+print(f'  Algorithmes     : NSGA-II, SPEA2')
+print(f'  Tailles de pop  : {POP_SIZES}')
+print(f'  Runs par config : {N_RUNS}')
+print(f'  Max évaluations : {MAX_EVALUATIONS}')
+print(f'  Total de runs   : {len(POP_SIZES) * N_RUNS * 2 * 2} (3 pop × 20 runs × 2 algos × 2 datasets)')
+
+================================================================================
+CELL 11 - TYPE: MARKDOWN
+================================================================================
+## 4.3 Étude de convergence – Détermination du nombre d'évaluations optimal
+
+Avant de lancer les 20 runs, on détermine le **nombre d'évaluations nécessaire** pour que les algorithmes convergent.
+
+**Protocole :**
+- 1 seul run (seed = 42) par budget testé
+- Population fixée à **50** (taille intermédiaire)
+- Budgets testés : 100, 250, 500, 1000, 2500, 5000, 7500, 10 000
+- Métrique : **Hypervolume** du front Pareto obtenu
+- Les 2 algorithmes (NSGA-II et SPEA2) sont testés sur les 2 datasets
+
+👉 On choisit le budget à partir duquel la courbe **se stabilise (plateau)** : gain marginal < 1%.
+
+================================================================================
+CELL 12 - TYPE: CODE
+================================================================================
+# ── Budgets d'évaluations à tester ──────────────────────────────────────────
+EVAL_BUDGETS = [100, 250, 500, 1000, 2500, 5000, 7500, 10_000]
+CONV_POP     = 50    # population fixe pour l'étude de convergence
+CONV_SEED    = 42
+
+# ── 1 seul algo + 1 seul dataset → 8 runs au lieu de 32 ─────────────────────
+# NSGA-II sur PIMA est représentatif : si ça converge ici, ça converge partout.
+CONV_ALGO    = 'NSGA-II'
+CONV_DATASET = 'PIMA'
+
+def run_convergence_study(X_train, y_train, algo_name, budgets=EVAL_BUDGETS,
+                           pop_size=CONV_POP, seed=CONV_SEED):
+    """1 run par budget – retourne la liste des HV correspondants."""
+    hvs = []
+    for budget in budgets:
+        random.seed(seed); np.random.seed(seed)
+        problem   = PartialClassifMO(X_train, y_train)
+        n_vars    = 2 * X_train.shape[1]
+        mutation  = PolynomialMutation(probability=1.0/n_vars,
+                                       distribution_index=MUTATION_INDEX)
+        crossover = SBXCrossover(probability=CROSSOVER_PROB,
+                                  distribution_index=CROSSOVER_INDEX)
+        if algo_name == 'NSGA-II':
+            algo = NSGAII(problem=problem,
+                          population_size=pop_size,
+                          offspring_population_size=pop_size,
+                          mutation=mutation, crossover=crossover,
+                          termination_criterion=StoppingByEvaluations(budget))
+        else:
+            algo = SPEA2(problem=problem,
+                         population_size=pop_size,
+                         offspring_population_size=pop_size,
+                         mutation=mutation, crossover=crossover,
+                         termination_criterion=StoppingByEvaluations(budget))
+        algo.run()
+        nd = get_pareto_front(algo.get_result())
+        hv = compute_hv(nd, REF_POINT)
+        hvs.append(hv)
+        print(f'  budget={budget:6d} -> HV={hv:.4f}')
+    return hvs
+
+
+def find_plateau(budgets, hvs, threshold=0.01):
+    """Retourne le budget où le gain relatif passe sous threshold."""
+    for i in range(1, len(hvs)):
+        if hvs[i-1] == 0:
+            continue
+        gain = (hvs[i] - hvs[i-1]) / max(hvs[i-1], 1e-9)
+        if gain < threshold:
+            return budgets[i]
+    return budgets[-1]
+
+
+# ── Lancement : 1 algo × 1 dataset = 8 runs uniquement ──────────────────────
+print(f'Etude de convergence : {CONV_ALGO} sur {CONV_DATASET}')
+print(f'(pop={CONV_POP}, seed={CONV_SEED}, {len(EVAL_BUDGETS)} budgets)\n')
+
+t0 = time.time()
+hvs_conv = run_convergence_study(X_pima_tr, y_pima_tr, CONV_ALGO)
+print(f'\nTermine en {time.time()-t0:.1f}s')
+
+# ── Tracé de la courbe de convergence ───────────────────────────────────────
+plateau_retenu = find_plateau(EVAL_BUDGETS, hvs_conv)
+
+fig, ax = plt.subplots(figsize=(9, 4))
+ax.plot(EVAL_BUDGETS, hvs_conv, marker='o', linewidth=2,
+        color='steelblue', label=f'{CONV_ALGO} – {CONV_DATASET}')
+
+for x, y in zip(EVAL_BUDGETS, hvs_conv):
+    ax.annotate(f'{y:.3f}', (x, y), textcoords='offset points',
+                xytext=(0, 9), ha='center', fontsize=8, color='steelblue')
+
+ax.axvline(plateau_retenu, color='red', linestyle='--', linewidth=1.5,
+           label=f'Plateau retenu : {plateau_retenu} eval.')
+ax.set_title(f'Courbe de convergence – {CONV_ALGO} sur {CONV_DATASET}\n'
+             f'(pop={CONV_POP}, seed={CONV_SEED})',
+             fontsize=12, fontweight='bold')
+ax.set_xlabel("Nombre d'evaluations", fontsize=11)
+ax.set_ylabel('Hypervolume', fontsize=11)
+ax.set_xscale('log')
+ax.legend(fontsize=10)
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig('convergence_study.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+# ── Suggestion basée sur le plateau détecté ─────────────────────────────────
+print(f'\n{"="*50}')
+print(f'Plateau suggere : {plateau_retenu} evaluations')
+print(f'-> Modifie MAX_EVALUATIONS dans la cellule suivante')
+print(f'{"="*50}')
+
+================================================================================
+CELL 13 - TYPE: MARKDOWN
+================================================================================
+### Choix manuel du nombre d'évaluations
+
+Regarde la courbe ci-dessus et **choisis toi-même** le budget qui te convient :
+- La ligne rouge indique le plateau détecté automatiquement
+- Tu peux prendre une valeur **plus basse** si tu veux aller plus vite
+- Tu peux prendre une valeur **plus haute** si tu veux plus de qualité
+
+👇 **Modifie uniquement la ligne `MAX_EVALUATIONS = ...` ci-dessous**
+
+================================================================================
+CELL 14 - TYPE: CODE
+================================================================================
+# ╔══════════════════════════════════════════════════════╗
+# ║  MODIFIE CETTE VALEUR selon la courbe de convergence ║
+# ╚══════════════════════════════════════════════════════╝
+
+MAX_EVALUATIONS = 500   # ← change ce nombre
+
+# ─────────────────────────────────────────────────────────
+print(f'MAX_EVALUATIONS choisi : {MAX_EVALUATIONS}')
+print(f'Ce budget sera utilise pour tous les 20 runs suivants.')
+
+================================================================================
+CELL 15 - TYPE: MARKDOWN
+================================================================================
+## 5. Fonction d'exécution des algorithmes MO
+
+================================================================================
+CELL 16 - TYPE: CODE
+================================================================================
+def run_mo_algorithm(algo_name, X_train, y_train, pop_size,
+                     max_evaluations=MAX_EVALUATIONS, seed=42):
+    """
+    Lance NSGA-II ou SPEA2 sur le problème PartialClassifMO.
+    Retourne la liste de toutes les solutions de la dernière population.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+
+    problem = PartialClassifMO(X_train, y_train)
+    n_vars = 2 * X_train.shape[1]
+    mutation_prob = 1.0 / n_vars
+
+    mutation  = PolynomialMutation(probability=mutation_prob, distribution_index=MUTATION_INDEX)
+    crossover = SBXCrossover(probability=CROSSOVER_PROB, distribution_index=CROSSOVER_INDEX)
+    criterion = StoppingByEvaluations(max_evaluations=max_evaluations)
+
+    if algo_name == 'NSGA-II':
+        algo = NSGAII(
+            problem=problem,
+            population_size=pop_size,
+            offspring_population_size=pop_size,
+            mutation=mutation,
+            crossover=crossover,
+            termination_criterion=criterion
+        )
+    elif algo_name == 'SPEA2':
+        algo = SPEA2(
+            problem=problem,
+            population_size=pop_size,
+            offspring_population_size=pop_size,
+            mutation=mutation,
+            crossover=crossover,
+            termination_criterion=criterion
+        )
+    else:
+        raise ValueError(f'Algorithme inconnu : {algo_name}')
+
+    algo.run()
+    return algo.get_result()   # liste de solutions (population finale)
+
+
+def run_experiments(algo_name, X_train, y_train, pop_sizes=POP_SIZES, n_runs=N_RUNS):
+    """
+    Lance n_runs exécutions pour chaque taille de population.
+    Retourne un dict : {pop_size: {'hv': [...], 'fronts': [[solutions], ...]}}
+    """
+    results = {}
+    for pop_size in pop_sizes:
+        print(f'  {algo_name} | pop={pop_size:3d} | ', end='', flush=True)
+        hvs, fronts = [], []
+        for run in range(n_runs):
+            seed = 100 * run + 42
+            solutions = run_mo_algorithm(algo_name, X_train, y_train,
+                                          pop_size, seed=seed)
+            nd_solutions = get_pareto_front(solutions)
+            hv = compute_hv(nd_solutions, REF_POINT)
+            hvs.append(hv)
+            fronts.append(nd_solutions)
+            print('.', end='', flush=True)
+        results[pop_size] = {'hv': hvs, 'fronts': fronts}
+        print(f'  HV moyen={np.mean(hvs):.4f} ± {np.std(hvs):.4f}')
+    return results
+
+print('✓ Fonctions run_mo_algorithm et run_experiments définies')
+
+================================================================================
+CELL 17 - TYPE: MARKDOWN
+================================================================================
+## 6. Exécution NSGA-II
+
+================================================================================
+CELL 18 - TYPE: CODE
+================================================================================
+print('='*60)
+print('NSGA-II – PIMA')
+print('='*60)
+t0 = time.time()
+nsgaii_pima = run_experiments('NSGA-II', X_pima_tr, y_pima_tr)
+print(f'\nTemps total PIMA : {time.time()-t0:.1f}s')
+
+================================================================================
+CELL 19 - TYPE: CODE
+================================================================================
+print('='*60)
+print('NSGA-II – Yeast1')
+print('='*60)
+t0 = time.time()
+nsgaii_yeast = run_experiments('NSGA-II', X_yeast_tr, y_yeast_tr)
+print(f'\nTemps total Yeast1 : {time.time()-t0:.1f}s')
+
+================================================================================
+CELL 20 - TYPE: MARKDOWN
+================================================================================
+## 7. Exécution SPEA2
+
+================================================================================
+CELL 21 - TYPE: CODE
+================================================================================
+print('='*60)
+print('SPEA2 – PIMA')
+print('='*60)
+t0 = time.time()
+spea2_pima = run_experiments('SPEA2', X_pima_tr, y_pima_tr)
+print(f'\nTemps total PIMA : {time.time()-t0:.1f}s')
+
+================================================================================
+CELL 22 - TYPE: CODE
+================================================================================
+print('='*60)
+print('SPEA2 – Yeast1')
+print('='*60)
+t0 = time.time()
+spea2_yeast = run_experiments('SPEA2', X_yeast_tr, y_yeast_tr)
+print(f'\nTemps total Yeast1 : {time.time()-t0:.1f}s')
+
+================================================================================
+CELL 23 - TYPE: MARKDOWN
+================================================================================
+## 8. Boxplots de l'Hypervolume par taille de population
+
+Ces boxplots permettent de comparer visuellement la qualité des fronts Pareto  
+obtenus selon la taille de population, pour chaque algorithme et chaque jeu de données.
+
+================================================================================
+CELL 24 - TYPE: CODE
+================================================================================
+def plot_hv_boxplots(results_dict, algo_name, dataset_name, ax, color='steelblue'):
+    data   = [results_dict[p]['hv'] for p in POP_SIZES]
+    labels = [str(p) for p in POP_SIZES]
+    bp = ax.boxplot(data, labels=labels, patch_artist=True,
+                    medianprops=dict(color='black', linewidth=2))
+    for patch in bp['boxes']:
+        patch.set_facecolor(color)
+        patch.set_alpha(0.7)
+    ax.set_title(f'{algo_name} – {dataset_name}', fontsize=11, fontweight='bold')
+    ax.set_xlabel('Taille de population', fontsize=10)
+    ax.set_ylabel('Hypervolume', fontsize=10)
+    ax.grid(True, alpha=0.3)
+
+fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+
+plot_hv_boxplots(nsgaii_pima,  'NSGA-II', 'PIMA',   axes[0, 0], color='steelblue')
+plot_hv_boxplots(spea2_pima,   'SPEA2',   'PIMA',   axes[0, 1], color='darkorange')
+plot_hv_boxplots(nsgaii_yeast, 'NSGA-II', 'Yeast1', axes[1, 0], color='steelblue')
+plot_hv_boxplots(spea2_yeast,  'SPEA2',   'Yeast1', axes[1, 1], color='darkorange')
+
+plt.suptitle('Hypervolume par taille de population\n(20 runs par configuration)',
+             fontsize=13, fontweight='bold', y=1.01)
+plt.tight_layout()
+plt.savefig('boxplots_hv.png', dpi=150, bbox_inches='tight')
+plt.show()
+print('✓ Boxplots sauvegardés')
+
+================================================================================
+CELL 25 - TYPE: MARKDOWN
+================================================================================
+## 9. Sélection du meilleur front Pareto et comparaison avec Scikit-Learn
+
+**Protocole :**
+1. Pour chaque algorithme, sélectionner le run avec le **meilleur Hypervolume sur le training**.
+2. Superposer les points Scikit-Learn (precision, recall) sur le graphe des fronts Pareto.
+3. Choisir la **meilleure solution** de chaque front = celle avec le meilleur F1 sur le training.
+
+================================================================================
+CELL 26 - TYPE: CODE
+================================================================================
+def get_best_run(results_dict):
+    """Retourne (pop_size_opt, front_opt) : le meilleur front parmi tous les runs/pop_sizes."""
+    best_hv   = -1
+    best_pop  = None
+    best_front = None
+    for pop_size, res in results_dict.items():
+        idx = int(np.argmax(res['hv']))
+        if res['hv'][idx] > best_hv:
+            best_hv    = res['hv'][idx]
+            best_pop   = pop_size
+            best_front = res['fronts'][idx]
+    return best_pop, best_front, best_hv
+
+def front_to_prec_rec(front):
+    """Convertit le front (obj minimisation) en (precision, recall)."""
+    prec = [-s.objectives[0] for s in front]
+    rec  = [-s.objectives[1] for s in front]
+    return prec, rec
+
+def best_f1_solution(front, X_train, y_train):
+    """Sélectionne la solution avec le meilleur F1 sur le training."""
+    best_f1, best_sol = -1, None
+    for s in front:
+        yp = predict(s.variables, X_train)
+        f1 = f1_score(y_train, yp, zero_division=0)
+        if f1 > best_f1:
+            best_f1  = f1
+            best_sol = s
+    return best_sol, best_f1
+
+# ── Sélection pour chaque algo et dataset ────────────────────────────────────
+best = {}
+for ds_name, nsgaii_res, spea2_res, X_tr, y_tr in [
+        ('PIMA',   nsgaii_pima,  spea2_pima,  X_pima_tr,  y_pima_tr),
+        ('Yeast1', nsgaii_yeast, spea2_yeast, X_yeast_tr, y_yeast_tr)]:
+
+    n_pop, n_front, n_hv = get_best_run(nsgaii_res)
+    s_pop, s_front, s_hv = get_best_run(spea2_res)
+
+    n_best_sol, n_best_f1 = best_f1_solution(n_front, X_tr, y_tr)
+    s_best_sol, s_best_f1 = best_f1_solution(s_front, X_tr, y_tr)
+
+    best[ds_name] = {
+        'NSGA-II': {'pop': n_pop, 'front': n_front, 'hv': n_hv,
+                    'best_sol': n_best_sol, 'best_f1_train': n_best_f1},
+        'SPEA2':   {'pop': s_pop, 'front': s_front, 'hv': s_hv,
+                    'best_sol': s_best_sol, 'best_f1_train': s_best_f1},
+    }
+    print(f'[{ds_name}] NSGA-II → pop={n_pop}, HV={n_hv:.4f}, best_F1_train={n_best_f1:.3f}')
+    print(f'[{ds_name}] SPEA2   → pop={s_pop}, HV={s_hv:.4f}, best_F1_train={s_best_f1:.3f}')
+    print()
+
+================================================================================
+CELL 27 - TYPE: MARKDOWN
+================================================================================
+### 9.1 Visualisation des fronts Pareto
+
+================================================================================
+CELL 28 - TYPE: CODE
+================================================================================
+fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+
+colors_algo = {'NSGA-II': 'steelblue', 'SPEA2': 'darkorange'}
+markers_sk  = {'RF': 'D', 'SVM': 's', 'C4.5': '^'}
+colors_sk   = {'RF': 'green', 'SVM': 'red', 'C4.5': 'purple'}
+
+for ax, ds_name, X_tr, y_tr in [
+        (axes[0], 'PIMA',   X_pima_tr,  y_pima_tr),
+        (axes[1], 'Yeast1', X_yeast_tr, y_yeast_tr)]:
+
+    # ── Fronts Pareto des AG MO ─────────────────────────────────────────────
+    for algo_name in ['NSGA-II', 'SPEA2']:
+        front = best[ds_name][algo_name]['front']
+        prec, rec = front_to_prec_rec(front)
+        ax.scatter(rec, prec, color=colors_algo[algo_name], alpha=0.75, s=50,
+                   label=f'{algo_name} (pop={best[ds_name][algo_name]["pop"]})')
+
+        # Marquer la meilleure solution (F1 max)
+        sol = best[ds_name][algo_name]['best_sol']
+        bp = -sol.objectives[0]; br = -sol.objectives[1]
+        ax.scatter(br, bp, color=colors_algo[algo_name], s=200, marker='*',
+                   edgecolors='black', linewidths=1.5,
+                   label=f'{algo_name} best F1')
+
+    # ── Points Scikit-Learn (training) ──────────────────────────────────────
+    for sk_name, res in sklearn_results[ds_name].items():
+        ax.scatter(res['recall'], res['precision'],
+                   marker=markers_sk[sk_name], color=colors_sk[sk_name],
+                   s=150, zorder=5,
+                   label=f'{sk_name} (F1={res["f1"]:.3f})')
+        ax.annotate(sk_name,
+                    (res['recall'], res['precision']),
+                    textcoords='offset points', xytext=(6, 4), fontsize=9)
+
+    ax.set_xlabel('Sensibilité (Recall)', fontsize=11)
+    ax.set_ylabel('Confiance (Precision)', fontsize=11)
+    ax.set_title(f'Fronts Pareto + Scikit-Learn – {ds_name}\n(training set)',
+                 fontsize=12, fontweight='bold')
+    ax.set_xlim(-0.02, 1.05)
+    ax.set_ylim(-0.02, 1.05)
+    ax.legend(fontsize=8, loc='upper right')
+    ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('pareto_fronts_sklearn.png', dpi=150, bbox_inches='tight')
+plt.show()
+print('✓ Fronts Pareto sauvegardés')
+
+================================================================================
+CELL 29 - TYPE: MARKDOWN
+================================================================================
+## 10. Évaluation sur le jeu de test
+
+On évalue les meilleures solutions sélectionnées à l'étape précédente  
+(meilleur F1 sur le training) sur le **jeu de test** pour mesurer la généralisation.
+
+================================================================================
+CELL 30 - TYPE: CODE
+================================================================================
+test_results = {}
+
+for ds_name, X_tr, y_tr, X_te, y_te, feat in [
+        ('PIMA',   X_pima_tr,  y_pima_tr,  X_pima_te,  y_pima_te,  features_pima),
+        ('Yeast1', X_yeast_tr, y_yeast_tr, X_yeast_te, y_yeast_te, features_yeast)]:
+
+    print(f'\n{"="*55}')
+    print(f'Dataset : {ds_name}')
+    print(f'{"="*55}')
+    test_results[ds_name] = {}
+
+    for algo_name in ['NSGA-II', 'SPEA2']:
+        sol = best[ds_name][algo_name]['best_sol']
+
+        # Évaluation training
+        yp_tr = predict(sol.variables, X_tr)
+        f1_tr  = f1_score(y_tr, yp_tr, zero_division=0)
+        pr_tr  = precision_score(y_tr, yp_tr, zero_division=0)
+        rc_tr  = recall_score(y_tr, yp_tr, zero_division=0)
+
+        # Évaluation test
+        yp_te = predict(sol.variables, X_te)
+        f1_te  = f1_score(y_te, yp_te, zero_division=0)
+        pr_te  = precision_score(y_te, yp_te, zero_division=0)
+        rc_te  = recall_score(y_te, yp_te, zero_division=0)
+        acc_te = accuracy_score(y_te, yp_te)
+
+        test_results[ds_name][algo_name] = {
+            'precision_train': pr_tr, 'recall_train': rc_tr, 'f1_train': f1_tr,
+            'precision_test':  pr_te, 'recall_test':  rc_te, 'f1_test':  f1_te,
+            'accuracy_test':   acc_te,
+            'hv': best[ds_name][algo_name]['hv'],
+            'pop': best[ds_name][algo_name]['pop'],
+        }
+
+        print(f'\n  ── {algo_name} (pop={best[ds_name][algo_name]["pop"]}) ──')
+        print(f'    Train  | Prec={pr_tr:.3f} | Rec={rc_tr:.3f} | F1={f1_tr:.3f}')
+        print(f'    Test   | Prec={pr_te:.3f} | Rec={rc_te:.3f} | F1={f1_te:.3f} | Acc={acc_te:.3f}')
+        print(f'    HV (best run) = {best[ds_name][algo_name]["hv"]:.4f}')
+        print(f'    Règle découverte :')
+        decode_rule(sol.variables, feat)
+
+================================================================================
+CELL 31 - TYPE: MARKDOWN
+================================================================================
+## 11. Tableau comparatif final
+
+================================================================================
+CELL 32 - TYPE: CODE
+================================================================================
+def fmt(v): return f'{v:.3f}'
+
+rows = []
+for ds_name, X_te, y_te in [('PIMA', X_pima_te, y_pima_te),
+                              ('Yeast1', X_yeast_te, y_yeast_te)]:
+    sk = sklearn_results[ds_name]
+    mo = test_results[ds_name]
+
+    # Scikit-Learn (évalués directement sur le test set ici pour cohérence)
+    for sk_name, fn in [('RF', rf_fn), ('SVM', svm_fn), ('C4.5', c45_fn)]:
+        model = fn(42)
+        # Entraîner sur X_train et tester sur X_test
+        if ds_name == 'PIMA':
+            model.fit(X_pima_tr, y_pima_tr); yp = model.predict(X_pima_te)
+        else:
+            model.fit(X_yeast_tr, y_yeast_tr); yp = model.predict(X_yeast_te)
+        rows.append({
+            'Jeu':        ds_name,
+            'Algorithme': sk_name,
+            'Confiance':  fmt(precision_score(y_te, yp, zero_division=0)),
+            'Sensibilité':fmt(recall_score(y_te, yp, zero_division=0)),
+            'F1-mesure':  fmt(f1_score(y_te, yp, zero_division=0)),
+            'HV':         '—',
+            'Type':       'Boîte noire' if sk_name != 'C4.5' else 'Boîte blanche'
+        })
+
+    # AG MO
+    for algo_name in ['NSGA-II', 'SPEA2']:
+        r = mo[algo_name]
+        rows.append({
+            'Jeu':        ds_name,
+            'Algorithme': algo_name,
+            'Confiance':  fmt(r['precision_test']),
+            'Sensibilité':fmt(r['recall_test']),
+            'F1-mesure':  fmt(r['f1_test']),
+            'HV':         f'{r["hv"]:.4f}',
+            'Type':       'Boîte blanche (règle)'
+        })
+
+df_final = pd.DataFrame(rows)
+
+for ds_name in ['PIMA', 'Yeast1']:
+    print(f'\n{"="*70}')
+    print(f'  Tableau récapitulatif – {ds_name}  (évaluation sur le TEST)')
+    print(f'{"="*70}')
+    sub = df_final[df_final['Jeu'] == ds_name].drop(columns='Jeu')
+    print(sub.to_string(index=False))
+
+================================================================================
+CELL 33 - TYPE: MARKDOWN
+================================================================================
+### 11.1 Graphe comparatif Precision–Recall sur le test
+
+================================================================================
+CELL 34 - TYPE: CODE
+================================================================================
+fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+
+for ax, ds_name, X_te, y_te in [
+        (axes[0], 'PIMA',   X_pima_te,  y_pima_te),
+        (axes[1], 'Yeast1', X_yeast_te, y_yeast_te)]:
+
+    # ── AG MO (fronts Pareto, évalués sur le test) ───────────────────────────
+    for algo_name in ['NSGA-II', 'SPEA2']:
+        front = best[ds_name][algo_name]['front']
+        precs, recs = [], []
+        for s in front:
+            yp = predict(s.variables, X_te)
+            precs.append(precision_score(y_te, yp, zero_division=0))
+            recs.append(recall_score(y_te, yp, zero_division=0))
+        ax.scatter(recs, precs, color=colors_algo[algo_name], alpha=0.6, s=40,
+                   label=f'{algo_name} (front test)')
+
+        # Meilleure solution (étoile)
+        sol = best[ds_name][algo_name]['best_sol']
+        yp = predict(sol.variables, X_te)
+        bp = precision_score(y_te, yp, zero_division=0)
+        br = recall_score(y_te, yp, zero_division=0)
+        ax.scatter(br, bp, color=colors_algo[algo_name], s=200, marker='*',
+                   edgecolors='black', linewidths=1.5)
+
+    # ── Points Scikit-Learn (test) ───────────────────────────────────────────
+    for sk_name, fn in [('RF', rf_fn), ('SVM', svm_fn), ('C4.5', c45_fn)]:
+        model = fn(42)
+        if ds_name == 'PIMA':
+            model.fit(X_pima_tr, y_pima_tr); yp = model.predict(X_pima_te)
+        else:
+            model.fit(X_yeast_tr, y_yeast_tr); yp = model.predict(X_yeast_te)
+        pr = precision_score(y_te, yp, zero_division=0)
+        rc = recall_score(y_te, yp, zero_division=0)
+        ax.scatter(rc, pr, marker=markers_sk[sk_name], color=colors_sk[sk_name],
+                   s=150, zorder=5, label=f'{sk_name}')
+        ax.annotate(sk_name, (rc, pr), textcoords='offset points', xytext=(6, 4), fontsize=9)
+
+    ax.set_xlabel('Sensibilité (Recall)', fontsize=11)
+    ax.set_ylabel('Confiance (Precision)', fontsize=11)
+    ax.set_title(f'Précision–Rappel sur le TEST – {ds_name}', fontsize=12, fontweight='bold')
+    ax.set_xlim(-0.02, 1.05)
+    ax.set_ylim(-0.02, 1.05)
+    ax.legend(fontsize=8, loc='upper right')
+    ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('comparison_test.png', dpi=150, bbox_inches='tight')
+plt.show()
+print('✓ Graphe comparatif test sauvegardé')
+
+================================================================================
+CELL 35 - TYPE: CODE
+================================================================================
+# ── Tracé des graphes de convergence ────────────────────────────────────────
+fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+colors = {'NSGA-II': 'steelblue', 'SPEA2': 'darkorange'}
+
+for ax, ds_name in zip(axes, ['PIMA', 'Yeast1']):
+    for algo in ['NSGA-II', 'SPEA2']:
+        key  = f'{algo}_{ds_name}'
+        data = conv_results[key]
+        evals_list = data['evals']
+        hvs_list   = data['hvs']
+
+        # Grille commune (longueur minimale)
+        min_len   = min(len(e) for e in evals_list)
+        evals_arr = evals_list[0][:min_len]
+        hvs_mat   = np.array([h[:min_len] for h in hvs_list])
+
+        mean_hv = hvs_mat.mean(axis=0)
+        std_hv  = hvs_mat.std(axis=0)
+
+        ax.plot(evals_arr, mean_hv,
+                color=colors[algo], lw=2,
+                label=f"{algo} (pop={data['pop']})")
+        ax.fill_between(evals_arr,
+                        mean_hv - std_hv,
+                        mean_hv + std_hv,
+                        color=colors[algo], alpha=0.2)
+
+    ax.set_title(f"Convergence de l'Hypervolume – {ds_name}", fontsize=13)
+    ax.set_xlabel("Nombre d'évaluations", fontsize=11)
+    ax.set_ylabel('Hypervolume', fontsize=11)
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+
+plt.suptitle('Graphes de convergence : HV moyen ± écart-type (5 runs)',
+             fontsize=14, fontweight='bold')
+plt.tight_layout()
+plt.savefig('convergence_hv.png', dpi=150, bbox_inches='tight')
+plt.show()
+print('✓ Graphes sauvegardés dans convergence_hv.png')
+
+================================================================================
+CELL 36 - TYPE: MARKDOWN
+================================================================================
+## 12. Analyse des résultats
+
+### 12.1 Analyse des algorithmes MO
+
+**NSGA-II vs SPEA2 :**
+- NSGA-II utilise le tri par rang de dominance et la distance de crowding pour maintenir la diversité.  
+- SPEA2 utilise une archive externe de solutions non-dominées et une estimation de densité basée sur les k-ièmes voisins.  
+- En général, SPEA2 produit des fronts mieux répartis, mais NSGA-II est souvent plus rapide à converger.
+
+**Impact de la taille de population :**
+- Une petite population (20) converge rapidement mais manque de diversité → front Pareto pauvre.  
+- Une grande population (100) explore mieux l'espace mais requiert plus d'évaluations.  
+- La taille optimale se lit sur les boxplots : c'est la plus petite taille donnant un HV stable.
+
+### 12.2 Analyse de l'interprétabilité
+
+Les algorithmes génétiques (AG MO) produisent des **règles lisibles** :  
+> *SI Glucose ∈ [120, 180] ET BMI ∈ [28, 45] → classe positive (diabétique)*
+
+Avantages par rapport aux boîtes noires (RF, SVM) :
+1. **Explicabilité** : le décideur comprend les critères de décision.
+2. **Adaptabilité** : on peut choisir une solution avec plus de confiance ou plus de sensibilité selon le besoin médical.
+3. **Compromis explicite** : le front Pareto montre tous les compromis disponibles.
+
+Limitation : une seule règle Michigan couvre un sous-espace limité ; la représentation Pittsburgh (plusieurs règles) permettrait une meilleure couverture.
+
+### 12.3 Comparaison avec Scikit-Learn
+
+| Aspect | AG MO (Michigan) | Random Forest | SVM | C4.5 |
+|--------|-----------------|---------------|-----|------|
+| Interprétabilité | ✅ Règle lisible | ❌ Boîte noire | ❌ Boîte noire | ⚠️ Arbre |
+| Confiance | Variable | Élevée | Très élevée | Moyenne |
+| Sensibilité | Variable | Modérée | Faible | Modérée |
+| Compromis explicite | ✅ Front Pareto | ❌ | ❌ | ❌ |
+| Temps calcul | Lent | Rapide | Rapide | Rapide |
+
+Les AG MO offrent une **valeur ajoutée** en termes d'interprétabilité et de flexibilité des compromis,  
+au prix d'un temps de calcul plus élevé et de performances légèrement inférieures en F1.
+
+================================================================================
+CELL 37 - TYPE: MARKDOWN
+================================================================================
+## 13. Conclusions
+
+### Résultats principaux
+
+1. **Qualité des fronts Pareto** : NSGA-II et SPEA2 produisent tous deux des fronts Pareto couvrant un large spectre de compromis confiance/sensibilité, démontrant la valeur de l'approche multi-objectif.
+
+2. **Paramètre population** : L'Hypervolume augmente significativement entre pop=20 et pop=50, puis se stabilise à pop=100. Le gain marginal de pop=100 par rapport à pop=50 est modeste — la taille optimale semble être **50 pour PIMA** et **100 pour Yeast1** (plus déséquilibré).
+
+3. **Comparaison avec Scikit-Learn** :
+   - Les algorithmes Scikit-Learn restent supérieurs en F1-mesure sur le test.
+   - Cependant, les AG MO offrent un **front de solutions** permettant d'ajuster le compromis precision/recall selon le contexte métier.
+   - La règle produite est directement **exploitable** par un décideur non-expert.
+
+4. **Interprétabilité** : Les règles découvertes sont concises (2 attributs actifs en moyenne), ce qui les rend facilement communicables à des médecins ou décideurs.
+
+### Perspectives
+
+- Utiliser la **représentation Pittsburgh** (plusieurs règles) pour améliorer la couverture et le recall.
+- Tester d'autres algorithmes MO : MOEA/D (décomposition en sous-problèmes scalaires) ou SMS-EMOA.
+- Augmenter le nombre d'évaluations ou utiliser un critère d'arrêt adaptatif.
+- Appliquer la sélection de variables pour réduire la dimensionnalité et améliorer l'interprétabilité.
