@@ -3,6 +3,13 @@
 **M2 MIAGE - Optimisation et Aide a la Decision (OAFD) | Universite de Lille**
 
 ---
+## create env virtuel
+python3 -m venv jmetalpy_env
+source jmetalpy_env/bin/activate
+pip install numpy matplotlib scipy
+pip install jmetalpy==1.6.0
+pip install scikit-leara
+
 
 ## Presentation du projet
 
